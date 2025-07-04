@@ -1,0 +1,337 @@
+#include <string>
+#include <vector>
+#include <cmath>
+#include <stdexcept>
+#include <iostream>
+#include <iomanip>
+#include <tuple>
+
+// 网格大小
+struct GridSize
+{
+    double m_longitude; // 经度差 (度)
+    double m_latitude;  // 纬度差 (度)
+    double m_altitude;  // 海拔差 (米)
+    GridSize() : m_longitude(0), m_latitude(0), m_altitude(0) {}
+    GridSize(double longitude, double latitude, double altitude) : m_longitude(longitude), m_latitude(latitude), m_altitude(altitude) {}
+};
+
+struct Point :GridSize
+{
+};
+
+std::ostream &operator<<(std::ostream &ss, const Point &point)
+{
+    ss << std::fixed << std::setprecision(9)
+       << "lon: " << point.m_longitude << ", "
+       << "lat: " << point.m_latitude << ", "
+       << "alt: " << point.m_altitude;
+    return ss;
+}
+
+// 北斗网格码解码器 - 基于GB/T 39409-2020标准
+class BeiDouGridDecoder
+{
+public:
+    //编码
+    std::string encode3D(double longitude, double latitude, double altitude, int level);
+    //解码
+    std::array<Point, 2> decode3D(const std::string &grid_code);
+    // 获取网格码的等级
+    int getLevel(const std::string &grid_code);
+
+private:
+    // 编码字符集
+    static const std::string ENCODE_CHARS;
+    // 网格级别对应的网格大小
+    static const std::vector<GridSize> LEVEL_PRECISION;
+    // 验证网格码有效性
+    void validateGridCode(const std::string &grid_code);
+    // 获取网格的最小点
+    Point getStartPoint(const std::string &grid_code);
+};
+
+
+const std::string BeiDouGridDecoder::ENCODE_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+
+const std::vector<GridSize> BeiDouGridDecoder::LEVEL_PRECISION = {
+    GridSize{6, 4, 445280},
+    GridSize{0.5, 0.5, 55660},
+    GridSize{0.25, 0.5 / 3, 27830},
+    GridSize{1.0 / 60, 1.0 / 60, 1850},
+    GridSize{1.0 / 900, 1.0 / 900, 123.69},
+    GridSize{1.0 / 1800, 1.0 / 1800, 61.84},
+    GridSize{1.0 / (1800 << 3), 1.0 / (1800 << 3), 7.73},
+    GridSize{1.0 / (1800 << 6), 1.0 / (1800 << 6), 0.97},
+    GridSize{1.0 / (1800 << 9), 1.0 / (1800 << 9), 0.121},
+    GridSize{1.0 / (1800 << 12), 1.0 / (1800 << 12), 0.015}};
+
+int BeiDouGridDecoder::getLevel(const std::string &grid_code)
+{
+    int n = grid_code.length();
+    int level = 0;
+    switch (n)
+    {
+    case 7:
+        level = 1;
+        break;
+    case 10:
+        level = 2;
+        break;
+    case 12:
+        level = 3;
+        break;
+    case 15:
+        level = 4;
+        break;
+    case 18:
+        level = 5;
+        break;
+    case 20:
+        level = 6;
+        break;
+    case 23:
+        level = 7;
+        break;
+    case 26:
+        level = 8;
+        break;
+    case 29:
+        level = 9;
+        break;
+    case 32:
+        level = 10;
+        break;
+    default:
+        throw std::invalid_argument("无效的网格码: " + grid_code + "\tlen: " + std::to_string(n));
+        break;
+    }
+    return level;
+}
+
+void BeiDouGridDecoder::validateGridCode(const std::string &grid_code)
+{
+    getLevel(grid_code); // 用于检测长度是否合规
+
+    for (char c : grid_code) // 简单检测内容是否合规
+    {
+        if (ENCODE_CHARS.find(c) == std::string::npos)
+        {
+            throw std::invalid_argument("非法字符: " + std::string(1, c));
+        }
+    }
+}
+
+Point BeiDouGridDecoder::getStartPoint(const std::string &grid_code)
+{
+    std::stringstream ss(grid_code);
+
+    auto getChar_N = [&ss](unsigned int n)
+    {
+        std::string ret;
+        char ch;
+        for (unsigned int i = 0; i != n; ++i)
+        {
+            if ((ch = ss.get()) == EOF)
+            {
+                throw std::runtime_error("endl");
+            }
+            ret += ch;
+        }
+        return ret;
+    };
+
+    // 单个16进制字符转数字
+    auto toNumber = [](char ch)
+    {
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')))
+        {
+            throw std::invalid_argument("非法字符: " + std::string(1, ch));
+        }
+        return ch > '9' ? ch - 'A' + 10 : ch - '0';
+    };
+
+    // 0级
+    int n_or_s = getChar_N(1) == "N" ? 1 : -1;
+    int up_or_down = getChar_N(1) == "0" ? 1 : -1;
+    int e_or_w = 1;
+
+    int level_i = 1;
+    Point start;
+    try
+    {
+        while (level_i <= 10)
+        {
+            const auto &size_i = LEVEL_PRECISION[level_i - 1];
+            if (level_i == 1)
+            {
+                int count_x = atoi(getChar_N(2).c_str());
+                int count_x_max = static_cast<int>(180 / size_i.m_longitude);
+                if(count_x > count_x_max)
+                {
+                    e_or_w = 1;
+                    count_x -= count_x_max + 1;
+                }
+                else
+                {
+                    e_or_w = -1;
+                    count_x = abs(count_x -= count_x_max);
+                }
+
+                start.m_longitude += count_x * size_i.m_longitude;
+                start.m_latitude += (getChar_N(1).at(0) - 'A') * size_i.m_latitude;
+                start.m_altitude += atoi(getChar_N(2).c_str()) * size_i.m_altitude;
+            }
+            else if (level_i == 3 || level_i == 6)
+            {
+                int num = toNumber(getChar_N(1).at(0));
+                start.m_longitude += (num % 2) * size_i.m_longitude;
+                start.m_latitude += (num / 2) * size_i.m_latitude;
+                start.m_altitude += toNumber(getChar_N(1).at(0)) * size_i.m_altitude;
+            }
+            else
+            {
+                start.m_longitude += toNumber(getChar_N(1).at(0)) * size_i.m_longitude;
+                start.m_latitude += toNumber(getChar_N(1).at(0)) * size_i.m_latitude;
+                start.m_altitude += toNumber(getChar_N(1).at(0)) * size_i.m_altitude;
+            }
+
+            level_i++;
+        }
+    }
+    catch (std::runtime_error &e)
+    {
+    }
+
+    start.m_longitude *= e_or_w;
+    start.m_latitude *= n_or_s;
+    start.m_altitude *= up_or_down;
+    return start;
+}
+
+std::string BeiDouGridDecoder::encode3D(double longitude, double latitude, double altitude, int level)
+{
+    if (level < 1 || level > 10)
+    {
+        throw std::invalid_argument("Illegal level");
+    }
+
+    // 数字转2为字符，左侧补0
+    auto intTo2DigitStr = [](int num)
+    {
+        std::stringstream ss;
+        ss << std::setw(2) << std::setfill('0') << num;
+        return ss.str();
+    };
+
+    // 数字到单个字符 “0” - “9”， “A” - “V”
+    auto toSingleChar = [](int x)
+    {
+        std::string ret;
+        if (x > 9)
+        {
+            std::string base = "A";
+            ret = base.at(0) + x - 10;
+        }
+        else
+        {
+            ret = std::to_string(x);
+        }
+        return ret;
+    };
+
+    // 0级处理
+    std::string ret = "";
+    ret += latitude < 0 ? "S" : "N";
+    ret += altitude < 0 ? "1" : "0";
+
+    latitude = fabs(latitude);
+    altitude = fabs(altitude);
+    bool is_east = true;
+    if(longitude < 0)
+    {
+        longitude = fabs(longitude);
+        is_east = false;
+    }
+    
+
+    int count_x = 0;
+    int count_y = 0;
+    int count_z = 0;
+
+    for (int i = 1; i <= level; ++i)
+    {
+        const auto &level_i = LEVEL_PRECISION[i - 1];
+        count_x = static_cast<int>(longitude / level_i.m_longitude);
+        count_y = static_cast<int>(latitude / level_i.m_latitude);
+        count_z = static_cast<int>(altitude / level_i.m_altitude);
+        if (i == 1)
+        {
+            int temp = (is_east ? count_x : -count_x - 1) + static_cast<int>(180 / level_i.m_longitude);
+            
+            ret += intTo2DigitStr(temp + 1) + toSingleChar(count_y + 10) + intTo2DigitStr(count_z);  
+        }
+        else if (i == 3 || i == 6)
+        {
+            ret += toSingleChar(count_x + count_y * 2) + toSingleChar(count_z);
+        }
+        else
+        {
+            ret += toSingleChar(count_x) + toSingleChar(count_y) + toSingleChar(count_z);
+        }
+
+        longitude -= count_x * level_i.m_longitude;
+        latitude -= count_y * level_i.m_latitude;
+        altitude -= count_z * level_i.m_altitude;
+    }
+
+    return ret;
+}
+
+std::array<Point, 2> BeiDouGridDecoder::decode3D(const std::string &grid_code)
+{
+    std::array<Point, 2> ret;
+    ret[0] = getStartPoint(grid_code);
+    int level = getLevel(grid_code);
+    const auto &size = LEVEL_PRECISION[level - 1];
+    double x = ret[0].m_longitude < 0 ? -size.m_longitude : size.m_longitude;
+    double y = ret[0].m_latitude < 0 ? -size.m_latitude : size.m_latitude;
+    double z = ret[0].m_altitude < 0 ? -size.m_altitude : size.m_altitude;
+
+    ret[1].m_longitude = ret[0].m_longitude + x;
+    ret[1].m_latitude = ret[0].m_latitude + y;
+    ret[1].m_altitude = ret[0].m_altitude + z;
+
+    return ret;
+}
+
+// 使用示例
+int main()
+{
+    BeiDouGridDecoder coder;
+
+    try
+    {
+        for (int i = 0; i <= 10; ++i)
+        {
+            for(int j = -1; j < 2; j +=2)
+            {
+                std::string gird_code = coder.encode3D(i * j, i * j, i * j * 100, 10);
+                // std::string gird_code = coder.encode3D(0, 0, 0, i);
+                std::cout << i*j << "\t" << i * j << "\t" << i * j *1000 << "\t" << gird_code << std::endl;
+                auto [point_start, point_end] = coder.decode3D(gird_code);
+                std::cout << point_start << std::endl;
+                std::cout << point_end << std::endl;
+                std::cout << std::endl;
+            }
+            std::cout << std::endl;
+            
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "错误: " << e.what() << std::endl;
+    }
+
+    return 0;
+}
